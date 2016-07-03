@@ -9,11 +9,9 @@ import (
 	"github.com/gorilla/securecookie"
 	"math/big"
 	"net/http"
-	"os/exec"
 	"regexp"
 	"time"
 
-	"github.com/LeKovr/go-base/database"
 	"github.com/LeKovr/go-base/logger"
 	"github.com/LeKovr/kvstore"
 	"github.com/LeKovr/smpp"
@@ -32,12 +30,8 @@ type Flags struct {
 	AppKey    string `long:"sms_session_key" description:"Key to encode user session (default: random key reset on restart)"`
 	BlockKey  string `long:"sms_block_key" default:"T<8rYvXmgLBdND(YW}3QRcLwh4$4P5eq" description:"Key to encode session blocks (16,32 or 62 byte)"`
 	FailDelay int    `long:"sms_delay" default:"5" description:"Delay response when password wrong (seconds)"`
-
-	SmsRetry int    `long:"sms_retry" default:"300" description:"Repeat SMS only after this period (seconds)"`
-	AppCmd   string `long:"cmd" description:"Command to run for authorized phone/ip pair (default write log only)"`
-
-	// kvstore
-	StoreName string `long:"store_file" default:"store.json" description:"File to store active sent codes at program exit"`
+	SmsRetry  int    `long:"sms_retry" default:"300" description:"Repeat SMS only after this period (seconds)"`
+	StoreName string `long:"sms_code_file" default:"store.json" description:"File to store active sent codes at program exit"`
 }
 
 // -----------------------------------------------------------------------------
@@ -62,13 +56,6 @@ func (pd PhoneData) Fetch(buf []byte) (kvstore.StoreData, error) {
 
 // -----------------------------------------------------------------------------
 
-// Record - таблица журнала авторизаций
-type Record struct {
-	Stamp         time.Time `xorm:"pk created"`
-	IP            string    `xorm:"ip pk"`
-	Phone, Status string
-}
-
 func init() {
 	phoneFilter, _ = regexp.Compile("[^0-9]")
 }
@@ -86,15 +73,14 @@ type Cookie struct {
 	Stamp time.Time
 }
 
-// ExecFunc вызывается для формирования доп. аргумента в вызове скрипта активации
-type ExecFunc func() string
+// HookFunc вызывается при успехе проверки телефона
+type HookFunc func(ip, phone, repeat string) string
 
 // App - Класс сервера API
 type App struct {
 	Store   *kvstore.Store
-	Addon   ExecFunc
+	Hook    *HookFunc
 	Cryptor *securecookie.SecureCookie
-	DB      *database.DB
 	Log     *logger.Log
 	Config  *Flags
 }
@@ -102,18 +88,21 @@ type App struct {
 // -----------------------------------------------------------------------------
 // Functional options
 
+// Config sets config struct
 func Config(c *Flags) func(a *App) error {
 	return func(a *App) error {
 		return a.setConfig(c)
 	}
 }
 
-func Addon(f ExecFunc) func(a *App) error {
+// Hook sets onSuccess hook func
+func Hook(f HookFunc) func(a *App) error {
 	return func(a *App) error {
-		return a.setAddon(f)
+		return a.setHook(&f)
 	}
 }
 
+// Cryptor sets securecookie generator
 func Cryptor(a *App) error {
 	return a.setCryptor()
 }
@@ -126,8 +115,8 @@ func (a *App) setConfig(c *Flags) error {
 	return nil
 }
 
-func (a *App) setAddon(f ExecFunc) error {
-	a.Addon = f
+func (a *App) setHook(f *HookFunc) error {
+	a.Hook = f
 	return nil
 }
 
@@ -149,11 +138,10 @@ func (a *App) setCryptor() error {
 
 // -----------------------------------------------------------------------------
 
-// New - Конструктор сервера API
-func New(db *database.DB, log *logger.Log, options ...func(a *App) error) (*App, error) {
+// New - Class constructor
+func New(log *logger.Log, options ...func(a *App) error) (*App, error) {
 
 	a := App{
-		DB:  db,
 		Log: log.WithField("in", "auth-sms"),
 	}
 
@@ -343,11 +331,10 @@ func (a *App) activate(ip, phone string, isRepeat bool) (resp Resp, err error) {
 	} else {
 		rep = 0
 	}
-	args := []string{ip, phone, fmt.Sprintf("%0d", rep)}
-	if a.Addon != nil {
-		args = append(args, a.Addon())
+	status := "NONE"
+	if a.Hook != nil {
+		status = (*a.Hook)(ip, phone, fmt.Sprintf("%0d", rep))
 	}
-	status := exeCmd(a.DB, a.Log, a.Config.AppCmd, args...)
 
 	//  3. Зашифровать и вернуть key *cfgAppKeyPass*
 	var key string
@@ -361,28 +348,4 @@ func (a *App) activate(ip, phone string, isRepeat bool) (resp Resp, err error) {
 	resp = Resp{Code: 2 + rep, IP: ip, Phone: phone, Data: key, Status: status}
 
 	return
-}
-
-// -----------------------------------------------------------------------------
-
-func exeCmd(db *database.DB, log *logger.Log, cfgCmd string, cmd ...string) string {
-	ret := "NONE"
-	if cfgCmd != "" {
-		log.Infof("Activate cmd %s: %+v", cfgCmd, cmd)
-		out, err := exec.Command(cfgCmd, cmd...).Output()
-		//  2. Записать в логи ip, phone, результат скрипта
-		if err != nil {
-			log.Warningf("Activate cmd ERROR: %+v (%s)", err, out)
-		} else {
-			log.Infof("Activate cmd OUT: %s", out)
-			ret = string(out)
-		}
-	} else {
-		log.Infof("Activate nocmd: %+v", cmd)
-	}
-	r := Record{IP: cmd[0], Phone: cmd[1], Status: ret}
-	if _, err := db.Engine.Insert(&r); err != nil {
-		log.Errorf("Record add error: %+v", err)
-	}
-	return ret
 }
