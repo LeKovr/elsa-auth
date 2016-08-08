@@ -6,10 +6,12 @@ import (
 	json "github.com/gorilla/rpc/v2/json2"
 	"github.com/gorilla/securecookie"
 	"net/http"
+	"text/template"
 	"time"
 
 	"github.com/LeKovr/go-base/database"
 	"github.com/LeKovr/go-base/logger"
+	"github.com/LeKovr/go-base/mailer"
 )
 
 const (
@@ -31,21 +33,12 @@ type Flags struct {
 	GIDHeader  string `long:"gid_header" default:"X-Elfire-GID" description:"Header field to store group ID"`
 
 	AdminGroup string `long:"adm_group" default:"admin" description:"Admin user group"`
-	AdminUser  string `long:"adm_user"  default:"admin" description:"Admin user login"`
+	AdminEmail string `long:"adm_email"  default:"ak@elfire.ru" description:"Admin user email"`
 	AdminPass  string `long:"adm_pass"  description:"Admin user password (Default: set random & log)"`
+	Template   string `long:"psw_template"  default:"messages.gohtml" description:"Mail templates file"`
 }
 
 // -----------------------------------------------------------------------------
-
-// LoginArgs - аргументы метода Login
-type LoginArgs struct {
-	Login, Password string
-}
-
-// LoginResp - результат метода Login
-type LoginResp struct {
-	JWT string
-}
 
 // Profile - структура профиля
 type Profile struct {
@@ -63,24 +56,31 @@ type Cookie struct {
 
 // Account is a user account table
 type Account struct {
-	ID       int64
-	Login    string `xorm:"unique"`
+	ID       int64  `xorm:"'id' pk autoincr"`
+	Login    string `xorm:"not null unique"`
 	Group    string
 	Name     string
 	Password string
-	Email    string
+	Email    string `xorm:"not null unique"`
 	Phone    string
-	Version  int `xorm:"version"` // Optimistic Locking
+	Data     string // some account related data
+	Disabled bool   `xorm:"not null default 0"`
+	Version  int    `xorm:"version"` // Optimistic Locking
 }
+
+// Accounts is an Account slice
+type Accounts []Account
 
 // -----------------------------------------------------------------------------
 
 // App - Класс сервера API
 type App struct {
-	Cryptor *securecookie.SecureCookie
-	DB      *database.DB
-	Log     *logger.Log
-	Config  *Flags
+	Cryptor  *securecookie.SecureCookie
+	DB       *database.DB
+	Template *template.Template
+	Log      *logger.Log
+	Mailer   *mailer.App
+	Config   *Flags
 }
 
 // -----------------------------------------------------------------------------
@@ -125,12 +125,12 @@ func (a *App) setCryptor() error {
 // -----------------------------------------------------------------------------
 
 // New - Конструктор сервера API
-func New(db *database.DB, log *logger.Log, options ...func(a *App) error) (*App, error) {
+func New(db *database.DB, log *logger.Log, options ...func(a *App) error) (a *App, err error) {
 
-	a := App{DB: db, Log: log.WithField("in", "auth-psw")}
+	a = &App{DB: db, Log: log.WithField("in", "auth-psw")}
 
 	for _, option := range options {
-		err := option(&a)
+		err := option(a)
 		if err != nil {
 			return nil, err
 		}
@@ -138,8 +138,14 @@ func New(db *database.DB, log *logger.Log, options ...func(a *App) error) (*App,
 	if a.Cryptor == nil {
 		a.setCryptor()
 	}
+
+	a.Template, err = template.New("").ParseFiles(a.Config.Template)
+	if err != nil {
+		return nil, err
+	}
+
 	a.initDB()
-	return &a, nil
+	return
 
 }
 
@@ -166,40 +172,56 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // -----------------------------------------------------------------------------
 
+// LoginArgs - аргументы метода Login
+type LoginArgs struct {
+	Login, Email, Password string
+}
+
+// LoginResp - результат метода Login
+type LoginResp struct {
+	JWT string
+}
+
+// -----------------------------------------------------------------------------
+
 // Login - авторизация пользователя
 func (a *App) Login(r *http.Request, args *LoginArgs, reply *LoginResp) error {
 	ip := r.Header.Get("Client-Ip")
 
-	var acc = Account{Login: args.Login}
+	var acc = Account{}
+	if args.Email != "" {
+		acc.Email = args.Email
+	} else if args.Login != "" {
+		acc.Login = args.Login
+	} else {
+		return &json.Error{Code: -32001, Message: "Login ID required"}
+	}
+
 	has, err := a.DB.Engine.Get(&acc)
 
 	if !has {
 		a.Log.Infof("Unknown user (%+v) from ip %s", acc, ip)
 		return &json.Error{Code: -32001, Message: "Login error"}
 	} else if err != nil {
-		a.Log.Warningf("User (%s) from ip %s fetch error: %+v", args.Login, ip, err)
+		a.Log.Warningf("User (%+v) from ip %s fetch error: %+v", acc, ip, err)
 		return &json.Error{Code: -32002, Message: "Login error"}
 	} else {
 		err = checkPassword(acc.Password, args.Password)
 		if err != nil {
-			a.Log.Infof("User (%s) with wrong pass: %+v", args.Login, args.Password)
+			a.Log.Infof("User with wrong pass: %+v", args)
 			time.Sleep(time.Second * time.Duration(a.Config.FailDelay)) // задержка от подбора
 
 			return &json.Error{Code: -32003, Message: "Login error"}
 		}
 	}
 
-	a.Log.Debugf("User (%s) confirmed for ip %s", args.Login, ip)
+	a.Log.Debugf("User (%s) confirmed for ip %s", args.Email, ip)
 
-	value := Cookie{Profile: Profile{Name: acc.Name, Group: acc.Group, ID: acc.ID}, Stamp: time.Now()}
-	a.Log.Debugf("Store %+v", value)
-
-	if encoded, err := a.Cryptor.Encode("appKey", value); err == nil {
-		reply.JWT = encoded
-		a.Log.Debugf("Set appKey %+v", encoded)
+	if jwt, err := a.genJWT(acc); err == nil {
+		reply.JWT = jwt
 		return nil
 	}
-	a.Log.Warningf("appKey encode error: %+v", err)
+
 	return &json.Error{Code: -32004, Message: "Login error"}
 }
 
@@ -210,48 +232,12 @@ type EmptyArgs struct {
 }
 
 // Profile - return current user's profile (from JWT)
-func (a *App) Profile(r *http.Request, args *EmptyArgs, reply *Profile) error {
+func (a *App) Profile(r *http.Request, args *EmptyArgs, reply *Cookie) error {
 	me, err := a.ParseJWT(r)
 	if err != nil {
 		return &json.Error{Code: -32011, Message: "Auth required"}
 	}
-	*reply = me.Profile
-	return nil
-}
-
-// -----------------------------------------------------------------------------
-
-// UserAddArgs - аргументы метода UserAdd
-type UserAddArgs struct {
-	Login, Name, Password, Group string
-}
-
-// UserAdd - add new user
-func (a *App) UserAdd(r *http.Request, args *UserAddArgs, reply *int64) error {
-	me, err := a.ParseJWT(r)
-	if err != nil {
-		a.Log.Warningf("JWT parse error: %+v", err)
-		return &json.Error{Code: -32011, Message: "Auth required"}
-	}
-	if me.Group != a.Config.AdminGroup {
-		a.Log.Warningf("Group %s does not match %s", me.Group, a.Config.AdminGroup)
-		return &json.Error{Code: -32012, Message: "Not enough perms"}
-	}
-
-	// TODO: ins/upd: has, err := x.Id(id).Get(a)
-	// TODO: себе нельзя менять группу и удалять аккаунт
-
-	p, err := hashedPassword(args.Password)
-	if err != nil {
-		a.Log.Errorf("User password hash error: %+v", err)
-		return &json.Error{Code: -32013, Message: "Method error"}
-	}
-	acc := Account{Login: args.Login, Name: args.Name, Password: p, Group: args.Group}
-	if _, err := a.DB.Engine.Insert(&acc); err != nil {
-		a.Log.Errorf("User add error: %+v", err)
-		return &json.Error{Code: -32010, Message: "Method error"}
-	}
-	*reply = acc.ID
+	*reply = *me
 	return nil
 }
 
@@ -271,7 +257,23 @@ func (a *App) ParseJWT(r *http.Request) (ret *Cookie, err error) {
 	} else {
 		err = errors.New("Token required")
 	}
+	// TODO: check expire
 	return
+}
+
+// -----------------------------------------------------------------------------
+
+// generate jwt
+func (a *App) genJWT(acc Account) (string, error) {
+	value := Cookie{Profile: Profile{Name: acc.Name, Group: acc.Group, ID: acc.ID}, Stamp: time.Now()}
+	a.Log.Debugf("Store %+v", value)
+	encoded, err := a.Cryptor.Encode("appKey", value)
+	if err == nil {
+		a.Log.Debugf("Set appKey %+v", encoded)
+		return encoded, nil
+	}
+	a.Log.Warningf("appKey encode error: %+v", err)
+	return "", err
 }
 
 // -----------------------------------------------------------------------------
@@ -279,6 +281,8 @@ func (a *App) ParseJWT(r *http.Request) (ret *Cookie, err error) {
 func (a *App) initDB() (err error) {
 
 	engine := a.DB.Engine
+
+	// TODO: SELECT name FROM sqlite_master WHERE type='table' and name = ?
 
 	err = engine.Sync(new(Account))
 	if err != nil {
@@ -294,7 +298,7 @@ func (a *App) initDB() (err error) {
 		pass := a.Config.AdminPass
 		if pass == "" {
 			pass = RandomString(8)
-			a.Log.Warningf("Initialize user %s with random pass %s", a.Config.AdminUser, pass)
+			a.Log.Warningf("Initialize user %s with random pass %s", a.Config.AdminEmail, pass)
 		}
 		var p string
 		p, err = hashedPassword(pass)
@@ -302,7 +306,7 @@ func (a *App) initDB() (err error) {
 			a.Log.Errorf("User password hash error: %+v", err)
 			return
 		}
-		acc := Account{Login: a.Config.AdminUser, Name: a.Config.AdminUser, Password: p, Group: a.Config.AdminGroup}
+		acc := Account{Login: a.Config.AdminEmail, Name: "admin", Email: a.Config.AdminEmail, Password: p, Group: a.Config.AdminGroup}
 		if _, err = engine.Insert(&acc); err != nil {
 			a.Log.Errorf("User add error: %+v", err)
 			return
