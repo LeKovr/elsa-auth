@@ -6,6 +6,8 @@ import (
 	json "github.com/gorilla/rpc/v2/json2"
 	"github.com/gorilla/securecookie"
 	"net/http"
+	"net/url"
+	"strings"
 	"text/template"
 	"time"
 
@@ -29,13 +31,15 @@ type Flags struct {
 	FailDelay int    `long:"psw_delay" default:"5" description:"Delay response when password wrong (seconds)"`
 
 	AuthHeader string `long:"auth_token_header" default:"X-Elfire-Token" description:"Header field to store auth token"`
+	AuthCookie string `long:"auth_token_cookie" default:"elfire_sso_token" description:"Cookie name to store auth token"`
 	UIDHeader  string `long:"uid_header" default:"X-Elfire-UID" description:"Header field to store user ID"`
 	GIDHeader  string `long:"gid_header" default:"X-Elfire-GID" description:"Header field to store group ID"`
 
-	AdminGroup string `long:"adm_group" default:"admin" description:"Admin user group"`
-	AdminEmail string `long:"adm_email"  default:"ak@elfire.ru" description:"Admin user email"`
-	AdminPass  string `long:"adm_pass"  description:"Admin user password (Default: set random & log)"`
-	Template   string `long:"psw_template"  default:"messages.gohtml" description:"Mail templates file"`
+	AdminGroup  string   `long:"adm_group" default:"admin" description:"Admin user group"`
+	AdminEmail  string   `long:"adm_email"  default:"ak@elfire.ru" description:"Admin user email"`
+	AdminPass   string   `long:"adm_pass"  description:"Admin user password (Default: set random & log)"`
+	AdminPrefix []string `long:"adm_prefix"  description:"Prefix of Admin allowed uri"`
+	Template    string   `long:"psw_template"  default:"messages.gohtml" description:"Mail templates file"`
 }
 
 // -----------------------------------------------------------------------------
@@ -157,12 +161,29 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.Log.Debugf("Got http request: %v", r)
 
 	if me, err := a.ParseJWT(r); err == nil {
-		w.Header().Set(a.Config.UIDHeader, me.Name)
-		w.Header().Set(a.Config.GIDHeader, me.Group)
+
+		// user logged in. Check group
+		if me.Group != a.Config.AdminGroup {
+			allowed := true
+			u := r.Header.Get("X-Original-Uri") // /my/psw/users?email=ee
+			for _, p := range a.Config.AdminPrefix {
+				if strings.HasPrefix(u, p) {
+					allowed = false // admin page
+					break
+				}
+			}
+			if !allowed {
+				a.Log.Debug("adm perm required")
+				http.Error(w, http.StatusText(401), 401)
+			}
+		}
+		//		w.Header().Set(a.Config.UIDHeader, me.Name)
+		//		w.Header().Set(a.Config.GIDHeader, me.Group)
 		w.WriteHeader(200)
 	} else if r.Header.Get(a.Config.AuthHeader) == "" {
 		a.Log.Debug("Got empty JWT header")
 		http.Error(w, http.StatusText(401), 401)
+
 	} else {
 		a.Log.Warningf("JWT parse error: %+v", err)
 		// Not authenticated user, show 401
@@ -200,7 +221,7 @@ func (a *App) Login(r *http.Request, args *LoginArgs, reply *LoginResp) error {
 	has, err := a.DB.Engine.Get(&acc)
 
 	if !has {
-		a.Log.Infof("Unknown user (%+v) from ip %s", acc, ip)
+		a.Log.Infof("Unknown user (%+v) from ip %s", args, ip)
 		return &json.Error{Code: -32001, Message: "Login error"}
 	} else if err != nil {
 		a.Log.Warningf("User (%+v) from ip %s fetch error: %+v", acc, ip, err)
@@ -212,17 +233,21 @@ func (a *App) Login(r *http.Request, args *LoginArgs, reply *LoginResp) error {
 			time.Sleep(time.Second * time.Duration(a.Config.FailDelay)) // задержка от подбора
 
 			return &json.Error{Code: -32003, Message: "Login error"}
+		} else if acc.Disabled {
+			return &json.Error{Code: -32011, Message: "User is disabled"}
 		}
 	}
 
 	a.Log.Debugf("User (%s) confirmed for ip %s", args.Email, ip)
 
-	if jwt, err := a.genJWT(acc); err == nil {
-		reply.JWT = jwt
-		return nil
+	var jwt string
+	jwt, err = a.genJWT(acc)
+	if err != nil {
+		return &json.Error{Code: -32004, Message: "Login error"}
 	}
 
-	return &json.Error{Code: -32004, Message: "Login error"}
+	reply.JWT = jwt
+	return nil
 }
 
 // -----------------------------------------------------------------------------
@@ -246,16 +271,31 @@ func (a *App) Profile(r *http.Request, args *EmptyArgs, reply *Cookie) error {
 // ParseJWT - Расшифровать ключ (TODO: проверить его валидность )
 func (a *App) ParseJWT(r *http.Request) (ret *Cookie, err error) {
 
-	auth := r.Header.Get(a.Config.AuthHeader)
 	l := len(Bearer)
-	if len(auth) > l+1 && auth[:l] == Bearer {
-		key := auth[l+1:]
-		ret = new(Cookie)
-		if err = a.Cryptor.Decode("appKey", key, ret); err == nil {
-			a.Log.Debugf("Key decoded (%+v)", *ret)
+	auth := r.Header.Get(a.Config.AuthHeader)
+	var key string
+
+	if auth == "" && a.Config.AuthCookie != "" {
+		c, _ := r.Cookie(a.Config.AuthCookie) // TODO: err
+		if c != nil {
+			a.Log.Debugf("Got cookie (%+v)", c)
+			key, _ = url.QueryUnescape(c.Value) // TODO: err
 		}
-	} else {
+	} else if len(auth) > l+1 && auth[:l] == Bearer {
+		key = auth[l+1:]
+	}
+
+	if key == "" {
 		err = errors.New("Token required")
+		return
+	}
+	a.Log.Debugf("JWT (%s)", key)
+
+	ret = new(Cookie)
+	if err = a.Cryptor.Decode("appKey", key, ret); err == nil {
+		a.Log.Debugf("Key decoded (%+v)", *ret)
+	} else {
+		a.Log.Warningf("JWT (%s) encode error: %+v", key, err)
 	}
 	// TODO: check expire
 	return

@@ -154,7 +154,7 @@ func (a *App) UserSave(r *http.Request, args *UserSaveArgs, reply *int64) error 
 			return &json.Error{Code: -32002, Message: "Save error"}
 		}
 		acc.Version = acc0.Version
-		_, err = a.DB.Engine.Id(args.ID).Update(&acc)
+		_, err = a.DB.Engine.Id(args.ID).Cols("login", "email", "name", "disabled", "data").Update(&acc)
 		op = "edit"
 	}
 	if err != nil {
@@ -310,7 +310,7 @@ func (a *App) UserSetPassword(r *http.Request, args *UserSetPasswordArgs, reply 
 
 	}
 	acc.Password = p
-	if _, err = a.DB.Engine.Update(&acc); err != nil {
+	if _, err = a.DB.Engine.Id(me.ID).Cols("password").Update(&acc); err != nil {
 		a.Log.Errorf("Password change error: %+v", err)
 		return &json.Error{Code: -32014, Message: "Method error"}
 	}
