@@ -40,6 +40,7 @@ type Flags struct {
 
 // -----------------------------------------------------------------------------
 
+// Service holds service attributes
 type Service struct {
 	Log      *log.Logger
 	Config   *Flags
@@ -60,6 +61,13 @@ func Mailer(m *mailer.App) func(srv *Service) error {
 	}
 }
 
+// Token sets cryptor object
+func Token(t *jwtutil.App) func(srv *Service) error {
+	return func(srv *Service) error {
+		return srv.setToken(t)
+	}
+}
+
 // -----------------------------------------------------------------------------
 // Internal setters
 
@@ -68,12 +76,17 @@ func (srv *Service) setMailer(m *mailer.App) error {
 	return nil
 }
 
+func (srv *Service) setToken(t *jwtutil.App) error {
+	srv.Token = t
+	return nil
+}
+
 // -----------------------------------------------------------------------------
 
 // New - Конструктор сервера API
-func New(logger *log.Logger, cfg *Flags, db *database.DB, token *jwtutil.App, field string, options ...func(srv *Service) error) (srv *Service, err error) {
+func New(logger *log.Logger, cfg *Flags, db *database.DB, field string, options ...func(srv *Service) error) (srv *Service, err error) {
 
-	srv = &Service{Log: logger, Config: cfg, DB: db, Token: token, IPField: field}
+	srv = &Service{Log: logger, Config: cfg, DB: db, IPField: field}
 
 	for _, option := range options {
 		err := option(srv)

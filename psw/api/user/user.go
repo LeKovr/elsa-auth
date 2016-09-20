@@ -15,11 +15,12 @@ import (
 
 // -----------------------------------------------------------------------------
 
+// Service holds service attributes
 type Service struct {
 	Log     *log.Logger
 	DB      *database.DB
 	Field   string // Context field for Sessiondata
-	IPField string // `long:"logger_realip_field" default:"real-ip" description:"Context field for Real ip"`
+	IPField string // Context field for Real ip
 }
 
 // -----------------------------------------------------------------------------

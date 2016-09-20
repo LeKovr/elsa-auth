@@ -19,6 +19,7 @@ import (
 
 // -----------------------------------------------------------------------------
 
+// Service holds service attributes
 type Service struct {
 	Log      *log.Logger
 	DB       *database.DB
