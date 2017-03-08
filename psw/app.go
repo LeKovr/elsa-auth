@@ -4,7 +4,7 @@ package psw
 import (
 	"errors"
 	json "github.com/gorilla/rpc/v2/json2"
-	"github.com/gorilla/securecookie"
+	"gopkg.in/gorilla/securecookie.v1"
 	"net/http"
 	"net/url"
 	"strings"
