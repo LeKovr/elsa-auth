@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	rpc "github.com/gorilla/rpc/v2/json2"
-	"github.com/gorilla/securecookie"
+	"gopkg.in/gorilla/securecookie.v1"
 	"math/big"
 	"net/http"
 	"regexp"
@@ -165,6 +165,7 @@ func New(log *logger.Log, options ...func(a *App) error) (*App, error) {
 func (a *App) Init(r *http.Request, args *ArgsKey, reply *Resp) error {
 
 	ip := r.Header.Get("Client-Ip")
+	a.Log.Debugf("*** Init: %+v (%s)", args, ip)
 
 	//		log.Printf("There is active code. Expire in %d sec (%+v)", wait, reply)
 
@@ -173,6 +174,7 @@ func (a *App) Init(r *http.Request, args *ArgsKey, reply *Resp) error {
 		keyData, err := a.parseKey(args.Key)
 		if err == nil {
 			*reply = Resp{Code: 4, Phone: keyData.Phone}
+			a.Log.Debugf("*** Init: resp code: 4, phone: %s", keyData.Phone)
 			return nil
 		}
 	}
@@ -185,6 +187,7 @@ func (a *App) Init(r *http.Request, args *ArgsKey, reply *Resp) error {
 func (a *App) InitForced(r *http.Request, args *ArgsKey, reply *Resp) error {
 
 	ip := r.Header.Get("Client-Ip")
+	a.Log.Debugf("*** InitForced: %+v (%s)", args, ip)
 
 	//		log.Printf("There is active code. Expire in %d sec (%+v)", wait, reply)
 
@@ -193,6 +196,7 @@ func (a *App) InitForced(r *http.Request, args *ArgsKey, reply *Resp) error {
 		keyData, err := a.parseKey(args.Key)
 		if err == nil {
 			*reply, _ = a.activate(ip, keyData.Phone, true)
+			a.Log.Debugf("*** InitForced: activate, phone: %s", keyData.Phone)
 			return nil
 		}
 	}
@@ -207,9 +211,11 @@ func (a *App) initCheck(ip string, reply *Resp) error {
 	//  2. Проверить баланс (32001)  *cfgAppMinBalance*
 	ok, err := smpp.IsBalanceOk(&a.Config.Flags, a.Log)
 	if err != nil {
+		a.Log.Debugf("*** InitCheck: -32001, balance error (%+v)", err.Error())
 		return &rpc.Error{Code: -32001, Message: "Balance error: " + err.Error()}
 	}
 	if !ok {
+		a.Log.Debug("*** InitCheck: -32002, balance exceeded")
 		return &rpc.Error{Code: -32002, Message: "Balance exceeded"}
 	}
 
@@ -227,6 +233,9 @@ func (a *App) initCheck(ip string, reply *Resp) error {
 		}
 		a.Store.Del(ip)
 		reply.Phone = data.(PhoneData).Phone
+		a.Log.Debugf("*** InitCheck: resp code: 0, expire phone: %s", reply.Phone)
+	} else {
+		a.Log.Debug("*** InitCheck: resp code: 0, no phone")
 	}
 	return nil
 }
@@ -236,11 +245,13 @@ func (a *App) initCheck(ip string, reply *Resp) error {
 func (a *App) Phone(r *http.Request, args *ArgsKey, reply *Resp) error {
 
 	ip := r.Header.Get("Client-Ip")
+	a.Log.Debugf("*** Phone: %+v (%s)", args, ip)
 
 	//  1. Проверить корректность phone (32010)
 	safe := phoneFilter.ReplaceAllLiteralString(args.Key, "")
 	a.Log.Debugf("Phone: %s", safe)
 	if len(safe) != 10 {
+		a.Log.Infof("*** Phone: -32010, incorrect phone (%s)", safe)
 		return &rpc.Error{Code: -32010, Message: "Incorrect phone number: " + safe}
 	}
 
@@ -277,6 +288,7 @@ func (a *App) Phone(r *http.Request, args *ArgsKey, reply *Resp) error {
 
 	//  6. вернуть - сколько секунд до повтора *cfgSmsRetry*
 	*reply = Resp{Code: 1, IP: ip, Phone: safe, Data: fmt.Sprintf("%d", a.Config.SmsRetry)}
+	a.Log.Debugf("Phone: code = 1, send SMS to %s", safe)
 	return nil
 
 }
@@ -285,6 +297,7 @@ func (a *App) Phone(r *http.Request, args *ArgsKey, reply *Resp) error {
 
 func (a *App) Code(r *http.Request, args *ArgsKey, reply *Resp) error {
 	ip := r.Header.Get("Client-Ip")
+	a.Log.Debugf("*** Code: %+v (%s)", args, ip)
 
 	//  1. Найти пару [Ip,code] и проверить наличие/совпадение code (32020) и просрочку по времени (32021)
 	data, ok := a.Store.Get(ip)
@@ -299,11 +312,13 @@ func (a *App) Code(r *http.Request, args *ArgsKey, reply *Resp) error {
 	wait := data.(PhoneData).Stamp.Unix() + int64(a.Config.SmsRetry) - time.Now().Unix()
 	a.Store.Del(ip)
 	if wait < 0 {
+		a.Log.Infof("*** Code: -32021, code expired, phone (%s)", data.(PhoneData).Phone)
 		return &rpc.Error{Code: -32021, Message: "Code is expired"}
 	}
 
 	//  2. Активация
 	*reply, _ = a.activate(ip, data.(PhoneData).Phone, false)
+	a.Log.Debugf("*** Code: activate, phone: %s", data.(PhoneData).Phone)
 	return nil
 }
 
